@@ -1,0 +1,69 @@
+name: signal
+on:
+  schedule:
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install yfinance requests
+      - env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          import yfinance as yf
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          IST = ZoneInfo("Asia/Kolkata")
+          INDEXES = {"NIFTY": "^NSEI", "SENSEX": "^BSESN"}
+          N, RETEST, TOL = 3, 6, 0.0004  # swing size, retest window (bars), zone 0.04%
+
+          def send(t):
+              requests.post(f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
+                            data={"chat_id": os.environ["TG_CHAT"], "text": t})
+
+          def scan(name, sym):
+              df = yf.Ticker(sym).history(period="5d", interval="5m").dropna()
+              if df.index[-1] + timedelta(minutes=5) > datetime.now(IST):
+                  df = df.iloc[:-1]  # drop unfinished candle
+              days = sorted(set(df.index.normalize()))
+              pdy = df[df.index.normalize() == days[-2]]
+              lv = [("PDH", pdy.High.max(), "H"), ("PDL", pdy.Low.min(), "L")]
+              base = df.iloc[:-(RETEST + 2)]
+              for i in range(N, len(base) - N):
+                  w = base.iloc[i - N:i + N + 1]
+                  if base.High.iloc[i] == w.High.max(): lv.append(("Swing High", base.High.iloc[i], "H"))
+                  if base.Low.iloc[i] == w.Low.min():  lv.append(("Swing Low", base.Low.iloc[i], "L"))
+              last, recent = df.iloc[-1], df.iloc[-(RETEST + 1):-1]
+              for lname, p, side in lv:
+                  if side == "L":  # sell-side liquidity swept -> bullish
+                      sw = recent[(recent.Low < p) & (recent.Close > p)]
+                      if sw.empty: continue
+                      mid = df.loc[sw.index[0]:].iloc[:-1]
+                      if (mid.Close > p).all() and last.Low <= p * (1 + TOL) and last.Close > p and last.Close > last.Open:
+                          sl = sw.Low.min(); e = last.Close
+                          return f"🟢 {name} BUY CE\nSweep+retest of {lname} {p:.0f}\nEntry ~{e:.0f} | SL {sl:.0f} | T1 {e+2*(e-sl):.0f}"
+                  else:  # buy-side liquidity swept -> bearish
+                      sw = recent[(recent.High > p) & (recent.Close < p)]
+                      if sw.empty: continue
+                      mid = df.loc[sw.index[0]:].iloc[:-1]
+                      if (mid.Close < p).all() and last.High >= p * (1 - TOL) and last.Close < p and last.Close < last.Open:
+                          sl = sw.High.max(); e = last.Close
+                          return f"🔴 {name} BUY PE\nSweep+retest of {lname} {p:.0f}\nEntry ~{e:.0f} | SL {sl:.0f} | T1 {e-2*(sl-e):.0f}"
+
+          now = datetime.now(IST)
+          if os.environ.get("EVENT") == "workflow_dispatch":
+              send("✅ Bot is connected and running.")
+          elif now.weekday() < 5 and (9, 20) <= (now.hour, now.minute) <= (15, 30):
+              for n, s in INDEXES.items():
+                  m = scan(n, s)
+                  if m: send(m)
+
+          PY
